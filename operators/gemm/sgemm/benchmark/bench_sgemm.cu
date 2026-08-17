@@ -162,7 +162,7 @@ int main()
         float reg_tile_max_rel_error = 0.0f;
         for (size_t index = 0; index < h_cpu.size(); ++index)
         {
-            const float abs_error = std::fabs(h_cpu[index] - h_shared_mem[index]);
+            const float abs_error = std::fabs(h_cpu[index] - h_tile_reg[index]);
             const float denominator = std::max(1.0f, std::fabs(h_cpu[index]));
             reg_tile_max_abs_error = std::max(reg_tile_max_abs_error, abs_error);
             reg_tile_max_rel_error = std::max(reg_tile_max_rel_error, abs_error / denominator);
@@ -239,7 +239,7 @@ int main()
         // reg tile timer
         check_cuda(cudaEventRecord(start), "record reg tile start");
 
-        for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_shared_mem(d_a, d_b, d_c, m, n, k);
+        for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_register_tiled(d_a, d_b, d_c, m, n, k);
 
         check_cuda(cudaGetLastError(), "reg tile kernel launch");
         check_cuda(cudaEventRecord(stop), "record reg tile stop");
