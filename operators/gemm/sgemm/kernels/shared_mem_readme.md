@@ -29,6 +29,38 @@ This document captures the design principles and implementation details of the s
      
 ## Core Design Philosophy
 
+
+## V2 Tiled Register Design
+
+The v2 kernel combines shared-memory tiling with register tiling. Its goal is to make each block perform more useful computation without increasing the thread-block size.
+
+- Thread block 16 x 16 threads or 256 threads per block.
+- Output tile 32 x 32 elements of C per block.
+- K tile 32 elements per iteration.
+- Per-thread output tile 2 x 2 elements.
+- Per-thread state four float accumulators held in registers.
+
+All 256 threads cooperatively load a 32 x 32 tile of A and a 32 x 32 tile of B into shared memory. Each thread loads four elements from A and four elements from B. After a block-wide synchronization barrier each thread uses its 2 x 2 register accumulators to update four output elements. A second barrier protects the shared-memory tiles before the next K tile overwrites them.
+
+This design preserves a moderate 256-thread block while increasing the work performed after each shared-memory load and synchronization step. Compared with the basic shared-memory kernel the cost of global-to-shared copies and barriers is distributed over four output elements per thread.
+
+## Experiment Run 4 V2 Tiled Register
+
+- Device NVIDIA GeForce RTX 3070 Ti Laptop GPU
+- Matrix shape M=1024 N=512 K=256
+- Warmup iterations 5
+- Timed iterations 30
+- V2 configuration block 16 x 16 output tile 32 x 32 K tile 32 per-thread tile 2 x 2
+
+Results
+
+- cuBLAS 0.0531 ms 5054.19 GFLOPS maximum relative error 6.91413879e-06
+- Naive CUDA 0.3022 ms 888.22 GFLOPS 17.57 percent of cuBLAS
+- Shared-memory CUDA 0.4006 ms 670.10 GFLOPS 13.26 percent of cuBLAS
+- Tiled-register CUDA 0.1852 ms 1449.38 GFLOPS 28.68 percent of cuBLAS maximum relative error 7.40907080e-06
+
+The tiled-register kernel passed the current correctness threshold of 1e-4. It is about 1.63 times faster than the naive kernel and about 2.16 times faster than the current 8 x 8 shared-memory baseline. It remains below cuBLAS because it has not yet introduced larger register tiles double buffering vectorized loads or warp-level tuning.
+
 ### Primary Goal: Data Reuse Through Shared Memory
 
 The main optimization strategy is to **reduce global memory accesses** by caching frequently-reused data in shared memory, rather than fetching from global memory repeatedly.
