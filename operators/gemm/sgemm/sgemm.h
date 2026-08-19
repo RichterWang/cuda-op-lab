@@ -31,5 +31,15 @@ void launch_sgemm_register_tiled(
     int m,
     int n,
     int k,
-    cudaStream_t stream = nullptr); 
+    cudaStream_t stream = nullptr);
+    
+// kernel for vector access, reg read and write, more single thread workload
+void launch_sgemm_vec_reg(
+    const float* a,
+    const float* b,
+    float* c,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream = nullptr);
 }  // namespace cuda_op_lab::sgemm

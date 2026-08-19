@@ -51,10 +51,11 @@ int main()
 {
     // matrix shape define
     // matrix size(256,384,320)
+    // test if edge check work(?)
     constexpr int m = 1024;  
     constexpr int n = 512;
-    constexpr int k = 256;
-    constexpr int warmup = 5;      // warmup iterations
+    constexpr int k = 2048;
+    constexpr int warmup = 5;   // warmup iterations
     constexpr int iterations = 30; // timed iterations
 
     // input matrices, host memory
@@ -66,6 +67,7 @@ int main()
     std::vector<float> h_naive(m * n);
     std::vector<float> h_shared_mem(m * n);
     std::vector<float> h_tile_reg(m * n);
+    std::vector<float> h_vec_reg(m * n); 
 
     // random generation of input matrix
     std::mt19937 generator(42);
@@ -169,6 +171,27 @@ int main()
         }
         // end shared memory add tile reg result check
 
+        // vector access and register optimize result check
+        check_cuda(cudaMemset(d_c, 0, sizeof(float) * h_vec_reg.size()), "clear vector reg c");
+
+        cuda_op_lab::sgemm::launch_sgemm_vec_reg(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "vector registered kernel launch");
+        check_cuda(cudaDeviceSynchronize(), "vector registered kernel synchronize");
+
+        check_cuda(cudaMemcpy(h_vec_reg.data(), d_c, sizeof(float) * h_vec_reg.size(), cudaMemcpyDeviceToHost), "copy vector registered result c");
+
+        float vec_reg_max_abs_error = 0.0f;
+        float vec_reg_max_rel_error = 0.0f;
+        for (size_t index = 0; index < h_cpu.size(); ++index)
+        {
+            const float abs_error = std::fabs(h_cpu[index] - h_vec_reg[index]);
+            const float denominator = std::max(1.0f, std::fabs(h_cpu[index]));
+            vec_reg_max_abs_error = std::max(vec_reg_max_abs_error, abs_error);
+            vec_reg_max_rel_error = std::max(vec_reg_max_rel_error, abs_error / denominator);
+        }
+        // end vector access and register optimize result check
+
         // warmup ==========================================================================================================
         // cublas kernel warmup
         for (int index = 0; index < warmup; ++index) cublas_sgemm_row_major(handle, d_a, d_b, d_c, m, n, k);
@@ -196,6 +219,13 @@ int main()
         check_cuda(cudaGetLastError(), "reg tile warmup launch");
         check_cuda(cudaDeviceSynchronize(), "reg tile warmup synchronize");
         // end reg tile kernel warmup
+
+        // vector access and register optimize kernel warmup
+        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_vec_reg(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "vec reg kernel warmup launch");
+        check_cuda(cudaDeviceSynchronize(), "vec reg kernel warmup synchronize");
+        // end vector access and register optimize kernel warmup
 
         // time recoding ====================================================================================================
         // use cuda event to record time
@@ -252,6 +282,22 @@ int main()
         const double reg_tile_gflops = 2.0 * static_cast<double>(m) * n * k / (reg_tile_average_ms * 1.0e6);
         // end reg tile timer
 
+        // vector register timer
+        check_cuda(cudaEventRecord(start), "record vector register start");
+
+        for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_vec_reg(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "vector register kernel launch");
+        check_cuda(cudaEventRecord(stop), "record vector register stop");
+        check_cuda(cudaEventSynchronize(stop), "wait vector register stop");
+
+        float vec_reg_elapsed_ms = 0.0f;
+        check_cuda(cudaEventElapsedTime(&vec_reg_elapsed_ms, start, stop), "vector register elapesd time");
+
+        const float vec_reg_average_ms = vec_reg_elapsed_ms / iterations;
+        const double vec_reg_gflops = 2.0 * static_cast<double>(m) * n * k / (vec_reg_average_ms * 1.0e6);
+        // end vector register timer
+
         // cublas timer
         check_cuda(cudaEventRecord(start), "record cuBLAS start");
 
@@ -271,6 +317,7 @@ int main()
         const double naive_relative_percent = 100.0 * naive_gflops / cublas_gflops;
         const double shared_mem_relative_percent = 100.0 * shared_mem_gflops / cublas_gflops;
         const double reg_tile_relative_percent = 100.0 * reg_tile_gflops / cublas_gflops;
+        const double vec_reg_relative_percent = 100.0 * vec_reg_gflops / cublas_gflops;
 
         // result output ========================================================================================
         // basic
@@ -297,6 +344,12 @@ int main()
         std::printf("tiled-register max abs error: %.8e\n", reg_tile_max_abs_error);
         std::printf("tiled-register max rel error: %.8e\n", reg_tile_max_rel_error);
 
+        // vertor register
+        std::printf("vector-register: %.4f ms, %.2f GFLOPS\n", vec_reg_average_ms, vec_reg_gflops);
+        std::printf("vector-register / cuBLAS: %.2f%%\n", vec_reg_relative_percent);
+        std::printf("vector-register max abs error: %.8e\n", vec_reg_max_abs_error);
+        std::printf("vector-register max rel error: %.8e\n", vec_reg_max_rel_error);
+       
         // release the resource ======================================================================================
         // release cuda event
         cudaEventDestroy(start);
@@ -312,7 +365,9 @@ int main()
         cudaFree(d_c);
 
         // if success, exit normally
-        return max_rel_error < 1.0e-4f && naive_max_rel_error < 1.0e-4f && shared_mem_max_rel_error < 1.0e-4f && reg_tile_max_rel_error < 1.0e-4f ? 0 : 1;
+        return max_rel_error < 1.0e-4f && naive_max_rel_error < 1.0e-4f 
+            && shared_mem_max_rel_error < 1.0e-4f && reg_tile_max_rel_error
+            && vec_reg_max_rel_error < 1.0e-4f ? 0 : 1;
     }
     catch (const std::exception &error) // catch all the error under cpp std
     {

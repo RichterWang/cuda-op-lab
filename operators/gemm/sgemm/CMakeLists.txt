@@ -14,11 +14,13 @@ add_executable(bench_sgemm
   benchmark/bench_sgemm.cu
 ) # add executeable file as entry
 
+# target link library, each time need modify here
 target_link_libraries(bench_sgemm PRIVATE 
   sgemm
   sgemm_v0
   sgemm_v1
   sgemm_v2
+  sgemm_v3
 )
 
 # sgemm naive add and link
@@ -69,5 +71,22 @@ target_link_libraries(sgemm_v2 PUBLIC
 )
 
 set_target_properties(sgemm_v2 PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
+
+# sgemm vector register add and link
+add_library(sgemm_v3 STATIC
+  kernels/vector_register.cu
+)
+
+target_include_directories(sgemm_v3 PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(sgemm_v3 PUBLIC
+  CUDA::cudart
+)
+
+set_target_properties(sgemm_v3 PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
 )
