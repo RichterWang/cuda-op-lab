@@ -42,4 +42,14 @@ void launch_sgemm_vec_reg(
     int n,
     int k,
     cudaStream_t stream = nullptr);
+
+void launch_sgemm_double_buf(
+    const float* a,
+    const float* b,
+    float* c,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream = nullptr
+);
 }  // namespace cuda_op_lab::sgemm

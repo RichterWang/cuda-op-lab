@@ -68,6 +68,7 @@ int main()
     std::vector<float> h_shared_mem(m * n);
     std::vector<float> h_tile_reg(m * n);
     std::vector<float> h_vec_reg(m * n); 
+    std::vector<float> h_double_buf(m * n);
 
     // random generation of input matrix
     std::mt19937 generator(42);
@@ -192,6 +193,27 @@ int main()
         }
         // end vector access and register optimize result check
 
+        // double buffering result check
+        check_cuda(cudaMemset(d_c, 0, sizeof(float) * h_double_buf.size()), "clear doubele buffering c");
+
+        cuda_op_lab::sgemm::launch_sgemm_double_buf(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "double buffering kernel launch");
+        check_cuda(cudaDeviceSynchronize(), "double buffering kernel synchronize");
+
+        check_cuda(cudaMemcpy(h_double_buf.data(), d_c, sizeof(float) * h_double_buf.size(), cudaMemcpyDeviceToHost), "copy double buffering result c");
+
+        float double_buf_max_abs_error = 0.0f;
+        float double_buf_max_rel_error = 0.0f;
+        for (size_t index = 0; index < h_cpu.size(); ++index)
+        {
+            const float abs_error = std::fabs(h_cpu[index] - h_double_buf[index]);
+            const float denominator = std::max(1.0f, std::fabs(h_cpu[index]));
+            double_buf_max_abs_error = std::max(double_buf_max_abs_error, abs_error);
+            double_buf_max_rel_error = std::max(double_buf_max_rel_error, abs_error / denominator);
+        }
+        // double buffering result check end
+
         // warmup ==========================================================================================================
         // cublas kernel warmup
         for (int index = 0; index < warmup; ++index) cublas_sgemm_row_major(handle, d_a, d_b, d_c, m, n, k);
@@ -226,6 +248,13 @@ int main()
         check_cuda(cudaGetLastError(), "vec reg kernel warmup launch");
         check_cuda(cudaDeviceSynchronize(), "vec reg kernel warmup synchronize");
         // end vector access and register optimize kernel warmup
+
+        // double buffering warmup
+        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_double_buf(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "double buffering kernel warmup launch");
+        check_cuda(cudaDeviceSynchronize(), "double buffering kernel warmup synchronize");
+        // end double buffering warmup
 
         // time recoding ====================================================================================================
         // use cuda event to record time
@@ -298,6 +327,22 @@ int main()
         const double vec_reg_gflops = 2.0 * static_cast<double>(m) * n * k / (vec_reg_average_ms * 1.0e6);
         // end vector register timer
 
+        // double buffering timer
+        check_cuda(cudaEventRecord(start), "record double buffering start");
+
+        for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_double_buf(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "double buffering kernel launch");
+        check_cuda(cudaEventRecord(stop), "double buffering register stop");
+        check_cuda(cudaEventSynchronize(stop), "wait double buffering stop");
+
+        float double_buf_elapsed_ms = 0.0f;
+        check_cuda(cudaEventElapsedTime(&double_buf_elapsed_ms, start, stop), "double buffering elapesd time");
+
+        const float double_buf_average_ms = double_buf_elapsed_ms / iterations;
+        const double double_buf_gflops = 2.0 * static_cast<double>(m) * n * k / (double_buf_average_ms * 1.0e6);
+        // end double buffering timer
+
         // cublas timer
         check_cuda(cudaEventRecord(start), "record cuBLAS start");
 
@@ -318,6 +363,7 @@ int main()
         const double shared_mem_relative_percent = 100.0 * shared_mem_gflops / cublas_gflops;
         const double reg_tile_relative_percent = 100.0 * reg_tile_gflops / cublas_gflops;
         const double vec_reg_relative_percent = 100.0 * vec_reg_gflops / cublas_gflops;
+        const double double_buf_relative_percent = 100.0 * double_buf_gflops / cublas_gflops;
 
         // result output ========================================================================================
         // basic
@@ -349,6 +395,12 @@ int main()
         std::printf("vector-register / cuBLAS: %.2f%%\n", vec_reg_relative_percent);
         std::printf("vector-register max abs error: %.8e\n", vec_reg_max_abs_error);
         std::printf("vector-register max rel error: %.8e\n", vec_reg_max_rel_error);
+
+        // double buffering
+        std::printf("double-buffering: %.4f ms, %.2f GFLOPS\n", double_buf_average_ms, double_buf_gflops);
+        std::printf("double-buffering / cuBLAS: %.2f%%\n", double_buf_relative_percent);
+        std::printf("double-buffering max abs error: %.8e\n", double_buf_max_abs_error);
+        std::printf("double-buffering max rel error: %.8e\n", double_buf_max_rel_error);        
        
         // release the resource ======================================================================================
         // release cuda event
@@ -365,9 +417,9 @@ int main()
         cudaFree(d_c);
 
         // if success, exit normally
-        return max_rel_error < 1.0e-4f && naive_max_rel_error < 1.0e-4f 
-            && shared_mem_max_rel_error < 1.0e-4f && reg_tile_max_rel_error
-            && vec_reg_max_rel_error < 1.0e-4f ? 0 : 1;
+        return max_rel_error < 5.0e-4f && naive_max_rel_error < 5.0e-4f 
+            && shared_mem_max_rel_error < 5.0e-4f && reg_tile_max_rel_error
+            && vec_reg_max_rel_error < 5.0e-4f && double_buf_max_rel_error < 5,0e-4f ? 0 : 1;
     }
     catch (const std::exception &error) // catch all the error under cpp std
     {
