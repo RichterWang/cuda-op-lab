@@ -15,6 +15,7 @@
 // optimize idea:
 //  fix bank conflict under tileB
 //  introduce cp.async to get ture double buffering
+//  final edge check
 __global__ void sgemm_double_buffering_kernel(const float* A, const float* B, float* C, int M, int N, int K)
 {
     // double buffering and shared mem padding
