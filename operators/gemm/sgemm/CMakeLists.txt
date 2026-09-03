@@ -22,6 +22,7 @@ target_link_libraries(bench_sgemm PRIVATE
   sgemm_v2
   sgemm_v3 # reg tiled + expand thread per block
   sgemm_v4 # double buffering + vector write back + check bank conflict version
+  sgemm_v4.1 # double buffering + asynchronous imply + bank conflict fix  
 )
 
 # sgemm naive add and link
@@ -108,3 +109,20 @@ target_link_libraries(sgemm_v4 PUBLIC
 set_target_properties(sgemm_v4 PROPERTIES
   CUDA_SEPARABLE_COMPILATION ON
 )
+
+#sgemm double buffering asynchronous imply + bank conflict fix
+add_library(sgemm_v4.1 STATIC
+  kernels/asynchronous.cu
+)
+
+target_include_directories(sgemm_v4.1 PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+target_link_libraries(sgemm_v4.1 PUBLIC
+  CUDA::cudart
+)
+
+set_target_properties(sgemm_v4.1 PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+) 

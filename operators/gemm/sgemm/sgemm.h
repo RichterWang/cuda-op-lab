@@ -43,7 +43,19 @@ void launch_sgemm_vec_reg(
     int k,
     cudaStream_t stream = nullptr);
 
+// kernel for double buffering, vector write back
 void launch_sgemm_double_buf(
+    const float* a,
+    const float* b,
+    float* c,
+    int m,
+    int n,
+    int k,
+    cudaStream_t stream = nullptr
+);
+
+// kernel to solve bank conflict, introduce pipleine
+void launch_sgemm_asynchronous(
     const float* a,
     const float* b,
     float* c,

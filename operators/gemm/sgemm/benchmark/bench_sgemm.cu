@@ -69,6 +69,7 @@ int main()
     std::vector<float> h_tile_reg(m * n);
     std::vector<float> h_vec_reg(m * n); 
     std::vector<float> h_double_buf(m * n);
+    std::vector<float> h_async(m * n);
 
     // random generation of input matrix
     std::mt19937 generator(42);
@@ -214,54 +215,56 @@ int main()
         }
         // double buffering result check end
 
-        // warmup ==========================================================================================================
-        // cublas kernel warmup
-        for (int index = 0; index < warmup; ++index) cublas_sgemm_row_major(handle, d_a, d_b, d_c, m, n, k);
-        
-        check_cuda(cudaDeviceSynchronize(), "warmup synchronize");
-        // end cublas kernel warmup
+        // asynchronous result check
+        check_cuda(cudaMemset(d_c, 0, sizeof(float) * h_async.size()), "clear asynchronous c");
 
-        // naive kernel warmup
-        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_naive(d_a, d_b, d_c, m, n, k);
-        
-        check_cuda(cudaGetLastError(), "naive warmup launch");
-        check_cuda(cudaDeviceSynchronize(), "naive warmup synchronize");
-        // end naive kernel warmup
+        cuda_op_lab::sgemm::launch_sgemm_asynchronous(d_a, d_b, d_c, m, n, k);
 
-        // shared mem kernel warmup
-        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_shared_mem(d_a, d_b, d_c, m, n, k);
+        check_cuda(cudaGetLastError(), "asynchronous kernel launch");
+        check_cuda(cudaDeviceSynchronize(), "asynchronous kernel synchronize");
 
-        check_cuda(cudaGetLastError(), "shared mem warmup launch");
-        check_cuda(cudaDeviceSynchronize(), "shared mem warmup synchronize");
-        // end shared mem kernel warmup
+        check_cuda(cudaMemcpy(h_async.data(), d_c, sizeof(float) * h_async.size(), cudaMemcpyDeviceToHost), "copy asynchronous result c");
 
-        // reg tile kernel warmup
-        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_register_tiled(d_a, d_b, d_c, m, n, k);
+        float asynchronous_max_abs_error = 0.0f;
+        float asynchronous_max_rel_error = 0.0f;
+        for (size_t index = 0; index < h_cpu.size(); ++index)
+        {
+            const float abs_error = std::fabs(h_cpu[index] - h_async[index]);
+            const float denominator = std::max(1.0f, std::fabs(h_cpu[index]));
+            asynchronous_max_abs_error = std::max(asynchronous_max_abs_error, abs_error);
+            asynchronous_max_rel_error = std::max(asynchronous_max_rel_error, abs_error / denominator);
+        }
+        // asynchronous result check end
 
-        check_cuda(cudaGetLastError(), "reg tile warmup launch");
-        check_cuda(cudaDeviceSynchronize(), "reg tile warmup synchronize");
-        // end reg tile kernel warmup
-
-        // vector access and register optimize kernel warmup
-        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_vec_reg(d_a, d_b, d_c, m, n, k);
-
-        check_cuda(cudaGetLastError(), "vec reg kernel warmup launch");
-        check_cuda(cudaDeviceSynchronize(), "vec reg kernel warmup synchronize");
-        // end vector access and register optimize kernel warmup
-
-        // double buffering warmup
-        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_double_buf(d_a, d_b, d_c, m, n, k);
-
-        check_cuda(cudaGetLastError(), "double buffering kernel warmup launch");
-        check_cuda(cudaDeviceSynchronize(), "double buffering kernel warmup synchronize");
-        // end double buffering warmup
-
-        // time recoding ====================================================================================================
+        // warmup and caculate the time====================================================================================================
         // use cuda event to record time
         check_cuda(cudaEventCreate(&start), "create start event");
         check_cuda(cudaEventCreate(&stop), "create stop event");
 
-        // naive timer
+        // cublas kernel warmup and timer
+        for (int index = 0; index < warmup; ++index) cublas_sgemm_row_major(handle, d_a, d_b, d_c, m, n, k);
+        
+        check_cuda(cudaDeviceSynchronize(), "warmup synchronize");
+        check_cuda(cudaEventRecord(start), "record cuBLAS start");
+
+        for (int index = 0; index < iterations; ++index) cublas_sgemm_row_major(handle, d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaEventRecord(stop), "record cuBLAS stop");
+        check_cuda(cudaEventSynchronize(stop), "wait cuBLAS stop");
+
+        float cublas_elapsed_ms = 0.0f;
+        check_cuda(cudaEventElapsedTime(&cublas_elapsed_ms, start, stop), "cuBLAS elapsed time");
+
+        const float cublas_average_ms = cublas_elapsed_ms / iterations;
+        const double cublas_gflops = 2.0 * static_cast<double>(m) * n * k / (cublas_average_ms * 1.0e6);
+        // end cubals timer
+
+        // naive kernel warmup and timer
+        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_naive(d_a, d_b, d_c, m, n, k);
+        
+        check_cuda(cudaGetLastError(), "naive warmup launch");
+        check_cuda(cudaDeviceSynchronize(), "naive warmup synchronize");
+        
         check_cuda(cudaEventRecord(start), "record naive start");
 
         for (int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_naive(d_a, d_b, d_c, m, n, k);
@@ -279,7 +282,12 @@ int main()
         const double naive_gflops = 2.0 * static_cast<double>(m) * n * k / (naive_average_ms * 1.0e6);
         // end naive timer
 
-        // shared_mem timer
+        // shared mem kernel warmup and timer
+        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_shared_mem(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "shared mem warmup launch");
+        check_cuda(cudaDeviceSynchronize(), "shared mem warmup synchronize");
+        
         check_cuda(cudaEventRecord(start), "record shared mem start");
 
         for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_shared_mem(d_a, d_b, d_c, m, n, k);
@@ -295,7 +303,12 @@ int main()
         const double shared_mem_gflops = 2.0 * static_cast<double>(m) * n * k / (shared_mem_average_ms * 1.0e6);
         // end shared_mem timer
 
-        // reg tile timer
+        // reg tile kernel warmup and timer
+        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_register_tiled(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "reg tile warmup launch");
+        check_cuda(cudaDeviceSynchronize(), "reg tile warmup synchronize");
+        
         check_cuda(cudaEventRecord(start), "record reg tile start");
 
         for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_register_tiled(d_a, d_b, d_c, m, n, k);
@@ -311,7 +324,12 @@ int main()
         const double reg_tile_gflops = 2.0 * static_cast<double>(m) * n * k / (reg_tile_average_ms * 1.0e6);
         // end reg tile timer
 
-        // vector register timer
+        // vector access and register optimize kernel warmup and timer
+        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_vec_reg(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "vec reg kernel warmup launch");
+        check_cuda(cudaDeviceSynchronize(), "vec reg kernel warmup synchronize");
+        
         check_cuda(cudaEventRecord(start), "record vector register start");
 
         for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_vec_reg(d_a, d_b, d_c, m, n, k);
@@ -327,7 +345,12 @@ int main()
         const double vec_reg_gflops = 2.0 * static_cast<double>(m) * n * k / (vec_reg_average_ms * 1.0e6);
         // end vector register timer
 
-        // double buffering timer
+        // double buffering warmup and timer
+        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_double_buf(d_a, d_b, d_c, m, n, k);
+
+        check_cuda(cudaGetLastError(), "double buffering kernel warmup launch");
+        check_cuda(cudaDeviceSynchronize(), "double buffering kernel warmup synchronize");
+        
         check_cuda(cudaEventRecord(start), "record double buffering start");
 
         for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_double_buf(d_a, d_b, d_c, m, n, k);
@@ -343,27 +366,34 @@ int main()
         const double double_buf_gflops = 2.0 * static_cast<double>(m) * n * k / (double_buf_average_ms * 1.0e6);
         // end double buffering timer
 
-        // cublas timer
-        check_cuda(cudaEventRecord(start), "record cuBLAS start");
+        // asynchronous warmup and timer
+        for (int index = 0; index < warmup; ++index) cuda_op_lab::sgemm::launch_sgemm_asynchronous(d_a, d_b, d_c, m, n, k);
 
-        for (int index = 0; index < iterations; ++index) cublas_sgemm_row_major(handle, d_a, d_b, d_c, m, n, k);
+        check_cuda(cudaGetLastError(), "asynchronous kernel warmup launch");
+        check_cuda(cudaDeviceSynchronize(), "asynchronous kernel warmup synchronize");
+        
+        check_cuda(cudaEventRecord(start), "record asynchronous start");
 
-        check_cuda(cudaEventRecord(stop), "record cuBLAS stop");
-        check_cuda(cudaEventSynchronize(stop), "wait cuBLAS stop");
+        for(int index = 0; index < iterations; ++index) cuda_op_lab::sgemm::launch_sgemm_asynchronous(d_a, d_b, d_c, m, n, k);
 
-        float cublas_elapsed_ms = 0.0f;
-        check_cuda(cudaEventElapsedTime(&cublas_elapsed_ms, start, stop), "cuBLAS elapsed time");
+        check_cuda(cudaGetLastError(), "asynchronous kernel launch");
+        check_cuda(cudaEventRecord(stop), "asynchronous register stop");
+        check_cuda(cudaEventSynchronize(stop), "wait asynchronous stop");
 
-        const float cublas_average_ms = cublas_elapsed_ms / iterations;
-        const double cublas_gflops = 2.0 * static_cast<double>(m) * n * k / (cublas_average_ms * 1.0e6);
-        // end cubals timer
+        float asynchronous_elapsed_ms = 0.0f;
+        check_cuda(cudaEventElapsedTime(&asynchronous_elapsed_ms, start, stop), "double buffering elapesd time");
 
+        const float asynchronous_average_ms = asynchronous_elapsed_ms / iterations;
+        const double asynchronous_gflops = 2.0 * static_cast<double>(m) * n * k / (asynchronous_average_ms * 1.0e6);
+        // end asychronous warmup and timer
+ 
         // cal relative percent
         const double naive_relative_percent = 100.0 * naive_gflops / cublas_gflops;
         const double shared_mem_relative_percent = 100.0 * shared_mem_gflops / cublas_gflops;
         const double reg_tile_relative_percent = 100.0 * reg_tile_gflops / cublas_gflops;
         const double vec_reg_relative_percent = 100.0 * vec_reg_gflops / cublas_gflops;
         const double double_buf_relative_percent = 100.0 * double_buf_gflops / cublas_gflops;
+        const double asychronous_relative_percent = 100.0 * asynchronous_gflops / cublas_gflops;
 
         // result output ========================================================================================
         // basic
@@ -400,7 +430,13 @@ int main()
         std::printf("double-buffering: %.4f ms, %.2f GFLOPS\n", double_buf_average_ms, double_buf_gflops);
         std::printf("double-buffering / cuBLAS: %.2f%%\n", double_buf_relative_percent);
         std::printf("double-buffering max abs error: %.8e\n", double_buf_max_abs_error);
-        std::printf("double-buffering max rel error: %.8e\n", double_buf_max_rel_error);        
+        std::printf("double-buffering max rel error: %.8e\n", double_buf_max_rel_error);
+
+        // asychronous
+        std::printf("asynchronous: %.4f ms, %.2f GFLOPS\n", asynchronous_average_ms, asynchronous_gflops);
+        std::printf("asynchronous / cuBLAS: %.2f%%\n", asychronous_relative_percent);
+        std::printf("asynchronous max abs error: %.8e\n", asynchronous_max_abs_error);
+        std::printf("asynchronous max rel error: %.8e\n", asynchronous_max_rel_error);        
        
         // release the resource ======================================================================================
         // release cuda event
@@ -418,8 +454,9 @@ int main()
 
         // if success, exit normally
         return max_rel_error < 5.0e-4f && naive_max_rel_error < 5.0e-4f 
-            && shared_mem_max_rel_error < 5.0e-4f && reg_tile_max_rel_error
-            && vec_reg_max_rel_error < 5.0e-4f && double_buf_max_rel_error < 5,0e-4f ? 0 : 1;
+            && shared_mem_max_rel_error < 5.0e-4f && reg_tile_max_rel_error <5.0e-4f
+            && vec_reg_max_rel_error < 5.0e-4f && double_buf_max_rel_error < 5.0e-4f 
+            && asynchronous_max_rel_error < 5.0e-4f ? 0 : 1;
     }
     catch (const std::exception &error) // catch all the error under cpp std
     {
