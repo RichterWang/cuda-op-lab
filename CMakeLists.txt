@@ -15,3 +15,4 @@ find_package(CUDAToolkit REQUIRED)
 enable_testing()
 
 add_subdirectory(operators/gemm/sgemm)
+add_subdirectory(operators/transformer_ops)
