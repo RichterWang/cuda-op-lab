@@ -3,3 +3,5 @@
 # line here, the root CMakeLists.txt never needs to change.
 
 add_subdirectory(stable_softmax)
+add_subdirectory(rms_norm)
+add_subdirectory(flash_attention)
