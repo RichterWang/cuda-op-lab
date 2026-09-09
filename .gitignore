@@ -3,3 +3,4 @@ build/
 *.a
 *.so
 results/
+temp_draft/

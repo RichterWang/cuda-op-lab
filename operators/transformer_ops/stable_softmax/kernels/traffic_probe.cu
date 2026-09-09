@@ -1,34 +1,3 @@
-// Traffic probes. These are not softmax kernels; they exist to measure how many
-// bytes actually reach DRAM, using only cudaEvent timing.
-//
-// The bandwidth numbers in the benchmark always divide by the *ideal* traffic
-// (one read + one write per element), so extra passes over a row show up as
-// extra time rather than extra bytes. That makes it possible to infer real DRAM
-// traffic from the timings, but only by arithmetic. These probes turn the
-// inference into a direct measurement:
-//
-//   probe_1read : reads the row once, writes once          -> traffic 2N
-//   probe_3read : reads the row three times, writes once   -> traffic 4N
-//
-// If a shape is genuinely DRAM bound with all three passes missing cache, then
-// t(3read) / t(1read) should approach 2.0. If passes 2 and 3 hit in L1, the
-// ratio should stay near 1.0. If the shape is bound by per-row overhead rather
-// than bandwidth, both probes will be far below the copy ceiling and the ratio
-// says little.
-//
-// probe_3read keeps the same data dependency chain as the real kernel (pass 2
-// needs the row max, pass 3 needs the row sum) so the compiler cannot merge the
-// passes or hoist the loads. Only the exp() calls are removed, since the point
-// is to isolate traffic, not arithmetic.
-//
-// Both probes are templated on block size, because the block-size experiment
-// showed that L1 hit rate depends on how many rows are resident per SM. The
-// 256-thread probes match launch_softmax_warp_reduce; the 1024-thread ones match
-// what launch_softmax_adaptive picks for long rows. Comparing the two answers a
-// question the 256-thread probe cannot: once a large block has already pulled
-// passes 2 and 3 into L1, is there any DRAM traffic left for a two-pass
-// algorithm to remove?
-
 #include <cuda_runtime.h>
 
 #include <cfloat>

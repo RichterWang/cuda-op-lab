@@ -1,18 +1,4 @@
-// Bandwidth roofline reference: y = x, nothing else.
-//
-// This is not a softmax. It exists because 448 GB/s is the *theoretical* peak
-// derived from clock times bus width, and real achievable bandwidth is usually
-// only 80-90% of that. Without this measurement we cannot tell whether a
-// softmax kernel at 348 GB/s has 100 GB/s left on the table or is already
-// within a few percent of the hardware limit.
-//
-// It moves exactly the traffic that an ideal softmax would move (one read plus
-// one write per element), so its GB/s number is directly comparable and forms
-// the real ceiling for every kernel in the table.
-//
-// float4 is used so the copy itself is not instruction-issue limited; the tail
-// is handled with scalar accesses so odd `cols` still works.
-
+// get the bandwidth roofline reference for a softmax kernel by copying the input to the output
 #include <cuda_runtime.h>
 
 #include "stable_softmax.h"
@@ -46,8 +32,6 @@ void launch_copy_baseline(const float *x, float *y, int rows, int cols, cudaStre
 
     if (vector_count > 0)
     {
-        // Cap the grid so each thread handles several float4s. Persistent-style
-        // looping keeps launch overhead out of the measurement.
         const size_t needed_blocks = (vector_count + kBlockSize - 1) / kBlockSize;
         const unsigned blocks = static_cast<unsigned>(needed_blocks < 4096 ? needed_blocks : 4096);
 
