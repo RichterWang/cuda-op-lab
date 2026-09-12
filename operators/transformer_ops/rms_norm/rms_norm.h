@@ -166,9 +166,8 @@ void launch_copy_baseline(const __nv_bfloat16* x, __nv_bfloat16* y, int rows, in
 void launch_rmsnorm_probe(const __nv_bfloat16* x, const __nv_bfloat16* gamma, __nv_bfloat16* y, int rows, int cols, float eps, int block_size,
                           size_t dynamic_shared_bytes, cudaStream_t stream = nullptr);
 
-// What the hardware will actually grant for a given configuration. These come
-// from the occupancy API rather than from arithmetic, so registers, shared
-// memory and the thread/block limits are all accounted for together.
+
+// hardware based information struct (from probe function)
 struct ProbeInfo
 {
     int registers_per_thread;
