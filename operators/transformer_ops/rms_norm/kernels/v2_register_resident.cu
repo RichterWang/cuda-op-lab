@@ -1,39 +1,4 @@
 // v2: keep the row in registers between the two passes.
-//
-// v1 reads the row twice: once to accumulate the sum of squares, once to
-// normalize. v2 keeps each thread's slice of the row in registers after pass 1,
-// so pass 2 reads nothing but gamma. The reduction and the access width are
-// unchanged from v1; the only difference is where the data lives between passes.
-//
-// Why this is worth trying, and why the original reason was wrong. The obvious
-// argument is that it halves the read traffic, but that argument does not hold:
-// the copy baseline moves one read and one write per element, and v1 already
-// reaches 99.9% of it at cols=4096 and 5120. If pass 2 were really costing a
-// second trip to DRAM, v1 could not be at the ceiling. It is at the ceiling
-// because pass 2 mostly hits L1.
-//
-// The occupancy experiment (see measure_occupancy.cu) showed where that stops
-// being true. Shrinking L1 by requesting shared memory, at unchanged occupancy,
-// costs cols=8192 96.9% -> 89.4% and cols=11008 90.7% -> 80.8%, while cols=4096
-// and 5120 do not move at all. Rows of 16 KB and 21.5 KB stop fitting; rows of
-// 8 KB and 10 KB keep fitting. So the prediction for v2 is narrow and testable:
-// large rows should gain, small rows should not, because on small rows there is
-// nothing left to remove.
-//
-// What it costs. Each cached vector is 16 bytes, so 4 registers per thread per
-// vector. v1 measures 42 registers per thread; caching 3 vectors adds 12, which
-// can push blocks/SM down. That mattered less than expected: halving occupancy
-// on this kernel cost cols=8192 only 1 percentage point, because a
-// bandwidth-bound kernel does not need many resident warps to hide latency.
-//
-// The structural constraint. A local array stays in registers only if every
-// index into it is known at compile time; otherwise it spills to local memory,
-// which is DRAM with a cache in front, and the whole point is lost. So the
-// per-thread vector count has to be a template parameter with fully unrolled
-// loops over it, which in turn means only a fixed set of (block size, vectors
-// per thread) combinations exist. Shapes outside that set fall back to v1
-// rather than being handled by a slow generic path.
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -46,29 +11,29 @@ constexpr int kWarpSize = 32;
 constexpr unsigned kFullMask = 0xffffffffu;
 constexpr int kVecWidth = 8;
 
-// Registers consumed per cached vector: 16 bytes / 4 bytes per register.
+// Registers consumed per cached vector: 16 / 4
 constexpr int kRegistersPerVector = 4;
 
-// Ceiling on cached vectors per thread. At 4 vectors a thread holds 16 registers
-// of row data on top of v1's 42, which is where the register file starts to bite.
-// Shapes needing more than this fall back to v1.
+// experiment defined register ceiling of one thread per vec(to avoid register spill)
 constexpr int kMaxVecPerThread = 4;
 
+// cpp 11 & cpp 20
 union alignas(16) BF16x8
 {
-    float4 raw;
+    float4 row;
     __nv_bfloat16 elem[kVecWidth];
 };
 
-__device__ inline float warp_reduce_sum(float value)
+__device__ __forceinline__ float warp_reduce_sum(float value)
 {
     #pragma unroll
     for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) value += __shfl_xor_sync(kFullMask, value, offset);
     return value;
 }
 
+// tree reduction may costy
 template <int BlockSize>
-__device__ inline float block_reduce_sum(float value, float *shared)
+__device__ __forceinline__ float block_reduce_sum(float value, float *shared)
 {
     constexpr int kWarpsPerBlock = BlockSize / kWarpSize;
 
@@ -85,48 +50,40 @@ __device__ inline float block_reduce_sum(float value, float *shared)
     return total;
 }
 
-// VecPerThread is a template parameter, not a runtime value, so that `cache` can
-// be indexed by a compile-time constant after unrolling and therefore live in
-// registers. Making it a runtime loop bound would put the array in local memory
-// and turn the saved L1 reads into DRAM reads, which is worse than v1.
-//
-// The strided assignment (thread t owns vectors t, t + BlockSize, ...) is kept
-// from v1 rather than switching to contiguous per-thread chunks. Strided is what
-// keeps a warp's 32 accesses adjacent in memory and therefore coalesced; a
-// contiguous split would have each thread walking its own distant region and
-// break that.
+// template param, to make compile finate so that the space will malloc in register
 template <int BlockSize, int VecPerThread>
 __global__ void rmsnorm_resident_kernel(const __nv_bfloat16 *__restrict__ x, const __nv_bfloat16 *__restrict__ gamma, __nv_bfloat16 *__restrict__ y, int rows, int cols, float eps)
 {
     constexpr int kWarpsPerBlock = BlockSize / kWarpSize;
 
-    const int row = blockIdx.x;
+    const int row = blockIdx.x; // each block process a row
     if (row >= rows) return;
 
-    const int vec_cols = cols / kVecWidth;
+    const int vec_cols = cols / kVecWidth; // get vector index
 
+    // vec read gamma_vec, y_row, x_row
     const BF16x8 *x_row = reinterpret_cast<const BF16x8 *>(x + static_cast<size_t>(row) * cols);
     BF16x8 *y_row = reinterpret_cast<BF16x8 *>(y + static_cast<size_t>(row) * cols);
     const BF16x8 *gamma_vec = reinterpret_cast<const BF16x8 *>(gamma);
 
-    __shared__ float warp_partial[kWarpsPerBlock];
+    __shared__ float warp_partial[kWarpsPerBlock]; // store the data per warp
 
-    // The row data, held across the reduction. This is the whole point of v2.
+    // for each thread vec store, register resident
     BF16x8 cache[VecPerThread];
 
-    // Pass 1: read the row once, square-accumulate in fp32, and keep the bf16
-    // source in registers. Slots past the end of the row are left unwritten and
-    // never read back, since pass 2 applies the same bound.
-    float thread_sum = 0.0f;
+    // read the row and do square accmulataion(only use needed space)
+    float thread_sum = 0.0f; // FP32
     #pragma unroll
     for (int slot = 0; slot < VecPerThread; ++slot)
     {
-        const int index = threadIdx.x + slot * BlockSize;
-        if (index >= vec_cols) break;
+        const int index = threadIdx.x + slot * BlockSize; // col offset of each thread
+        if (index >= vec_cols) break; // other data will not write in
 
+        // get the buffer register
         cache[slot] = x_row[index];
 
-    #pragma unroll
+        // all caculate down in FP32 mod
+        #pragma unroll
         for (int part = 0; part < kVecWidth; ++part)
         {
             const float value = __bfloat162float(cache[slot].elem[part]);
@@ -135,18 +92,16 @@ __global__ void rmsnorm_resident_kernel(const __nv_bfloat16 *__restrict__ x, con
     }
 
     const float total = block_reduce_sum<BlockSize>(thread_sum, warp_partial);
-    const float scale = rsqrtf(total / static_cast<float>(cols) + eps);
+    const float scale = rsqrtf(total / static_cast<float>(cols) + eps); // get the RMS data of each row
 
-    // Pass 2: no load of x. gamma is still read, but every row reads the same
-    // cols-element vector, so after the first few blocks it is resident in cache
-    // and contributes almost no DRAM traffic.
+    // caculate the y result, only need to read gamma, which will stay in L1 cache after servial trail
     #pragma unroll
     for (int slot = 0; slot < VecPerThread; ++slot)
     {
         const int index = threadIdx.x + slot * BlockSize;
         if (index >= vec_cols) break;
 
-        const BF16x8 weight = gamma_vec[index];
+        const BF16x8 weight = gamma_vec[index]; // read from DRAM, a row share it
 
         BF16x8 out;
         #pragma unroll
@@ -160,15 +115,7 @@ __global__ void rmsnorm_resident_kernel(const __nv_bfloat16 *__restrict__ x, con
     }
 }
 
-// The set of (block size, vectors per thread) pairs that exist as instantiations.
-// Chosen so that BlockSize * VecPerThread covers vec_cols with as little surplus
-// as possible, since a thread whose slots all fall past the end of the row still
-// costs registers and still joins the reduction.
-//
-// Block size is 512 for every multi-vector case. That is not arbitrary: the block
-// size sweep found 512 fastest at every shape measured, by a wide margin over
-// 1024 (which leaves threads with no work at cols=4096) and over 128 and 256
-// (which give each thread too many vectors).
+// template param config struct
 struct Config
 {
     int block_size;
@@ -200,11 +147,9 @@ void launch_rmsnorm_resident(const __nv_bfloat16 *x, const __nv_bfloat16 *gamma,
 {
     if (rows <= 0 || cols <= 0) return;
 
-    const Config config = select_config(cols);
+    const Config config = select_config(cols); // choose the support
 
-    // Rows too long to cache, or not a multiple of the vector width, go to v1.
-    // Falling back is the honest option here: a generic v2 that spilled to local
-    // memory would be slower than v1 while looking like a new optimization.
+    // if not cacheable, use V1 rather than register resident
     if (!config.supported)
     {
         launch_rmsnorm_warp_vec(x, gamma, y, rows, cols, eps, stream);
@@ -241,14 +186,13 @@ void launch_rmsnorm_resident(const __nv_bfloat16 *x, const __nv_bfloat16 *gamma,
     }
 }
 
-// Reports what configuration a shape lands on and what the hardware grants for
-// it. The register count is the number to watch: if it exceeds v1's 42 by much
-// more than 4 * vec_per_thread, the cache has partly spilled to local memory and
-// the version is not doing what it claims.
+// report on the hardware status of each execute
 ResidentInfo query_rmsnorm_resident(int cols)
 {
+    // choose the config
     const Config config = select_config(cols);
 
+    // fill in the basic info
     ResidentInfo info{};
     info.supported = config.supported;
     info.block_size = config.block_size;
