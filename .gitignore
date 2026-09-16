@@ -4,3 +4,4 @@ build/
 *.so
 results/
 temp_draft/
+perf_results/
