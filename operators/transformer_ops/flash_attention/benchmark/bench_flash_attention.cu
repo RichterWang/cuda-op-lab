@@ -1,51 +1,3 @@
-// Flash attention benchmark: TFLOPS and HBM traffic against the unfused baseline,
-// plus a two-level accuracy check.
-//
-// Why the primary metric is not bandwidth. softmax and rms_norm are memory bound,
-// so "percent of the copy ceiling" was the only number that mattered there.
-// Attention has O(N^2 * d) arithmetic against O(N * d) of input, so the compute
-// intensity grows with N and the operator crosses from memory bound to compute
-// bound somewhere in the middle of the shapes below. Reporting one number would
-// hide that crossing, so three are reported per kernel:
-//
-//   TFLOPS       useful arithmetic per second, with the causal triangle counted
-//                correctly. This is the number that matters once N is large.
-//   HBM GB       bytes that must cross the memory bus, derived from the algorithm
-//                rather than measured. For v0 this includes the score matrix; for
-//                the fused kernels it does not. The whole thesis of the operator
-//                is visible in this column alone.
-//   speedup      against v0 at the same shape, which is what the optimization is
-//                actually worth.
-//
-// Accuracy uses the same two-level scheme as rms_norm -- a loose relative figure
-// against a double reference for context, and a tight ULP figure against the
-// bf16-rounded reference as the pass/fail gate -- but the ULP figure has to be
-// normalized differently here, and getting that wrong is easy.
-//
-// rms_norm's output is x * g / rms: every element is the same order of magnitude as
-// its input, so measuring each element's error in ULP *of that element* is the
-// right question. Attention's output is a convex combination of zero-mean V rows,
-// so it cancels. An output element can land near zero while every term that
-// produced it was order 1, and the absolute precision achievable for that element
-// is set by the magnitude of the terms, not by the magnitude of the result. Divide
-// the error by that near-zero element's own ULP and the ratio blows up on a kernel
-// that is doing nothing wrong.
-//
-// Measured, not assumed: the first version of this benchmark normalized per
-// element and reported 7 ULP for the *unfused baseline* at head_dim=128 while the
-// fused kernel reported 1. Two implementations sharing no arithmetic do not
-// disagree by 7x on a real bug in only one of them; the metric was reading
-// cancellation. Normalizing by the row's largest element -- the scale the row's
-// arithmetic actually operated at -- puts both at the same place.
-//
-// So: error is measured in ULP at the row scale. The tolerance stays modest,
-// because after that correction the online softmax's seq_len-long rescale chain is
-// the only remaining source of drift, and a wrong mask, a missing rescale, or a
-// dropped tile all move the answer far more than a few ULP.
-//
-// The exit code is non-zero when any shape fails, so this doubles as the
-// regression test under ctest.
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -73,38 +25,28 @@ using cuda_op_lab::flash_attention::unfused_workspace_bytes;
 constexpr int kWarmupIters = 3;
 constexpr int kTimedIters = 10;
 
-// Accuracy is checked on a small shape only. The host reference is O(N^2 * d) in
-// double precision and single threaded, so running it at N=4096 would dominate the
-// benchmark's runtime without testing anything the small shape does not. The
-// rescale chain is exercised by the same code path at any N.
+// persice check config(example shape)
 constexpr int kAccuracyBatch = 1;
 constexpr int kAccuracyHeads = 2;
 constexpr int kAccuracySeq = 256;
 
-// Row-scale ULP. 2.0 rather than rms_norm's 1.0 because the online rescale chain
-// is seq_len steps long and each step multiplies the accumulator by an inexact
-// exp(), so a small amount of drift is expected where rms_norm's single-pass
-// reduction had none.
+// ULP torlance
 constexpr float kUlpTolerance = 2.0f;
 
-// Above this the fp32 score matrix stops being a reasonable allocation. At
-// batch*heads=8 and N=4096 the workspace is 8 * 4096^2 * 4 bytes = 512 MB, which
-// on an 8 GB card competes with everything else. Shapes past the limit run the
-// fused kernels only and report v0 as skipped, rather than either crashing or
-// silently shrinking the shape.
+// the upper bound of the memory size(on 3070Ti)
 constexpr size_t kMaxWorkspaceBytes = 1ull << 30;  // 1 GB
 
-#define CUDA_CHECK(expr)                                                                                      \
-    do                                                                                                        \
-    {                                                                                                         \
+#define CUDA_CHECK(expr)                                                                                       \
+    do{                                                                                                        \
         const cudaError_t status = (expr);                                                                     \
         if (status != cudaSuccess)                                                                             \
-        {                                                                                                     \
+        {                                                                                                      \
             std::fprintf(stderr, "CUDA error %s at %s:%d\n", cudaGetErrorString(status), __FILE__, __LINE__);  \
-            std::exit(EXIT_FAILURE);                                                                          \
-        }                                                                                                     \
+            std::exit(EXIT_FAILURE);                                                                           \
+        }                                                                                                      \
     } while (0)
 
+// case struct 
 struct Case
 {
     AttentionShape shape;
@@ -112,15 +54,8 @@ struct Case
     const char* note;
 };
 
-// Real inference shapes rather than a sweep. Each entry answers a question:
-//   N=512    short prompt; the fixed per-block cost is still visible here.
-//   N=2048   llama-2 context. The main shape.
-//   N=4096   llama-2 max context. v0's workspace is largest here, so the traffic
-//            argument is most visible.
-//   d=128    llama-7b head_dim; halves the tile row count, so it separates
-//            "head_dim matters" from "tile count matters".
-//   causal   the mask a decoder actually uses. The fused kernels skip masked
-//            tiles, v0 computes them, so this is where the two diverge most.
+// case filling, N represent sequence_length
+// N small, show fixed expense; N large, show looping expense
 const std::vector<Case> kCases = {
     {{4, 8, 512, 64}, false, "short prompt, dense"},
     {{4, 8, 512, 64}, true, "short prompt, causal"},
@@ -133,28 +68,23 @@ const std::vector<Case> kCases = {
 void fill_normal(std::vector<__nv_bfloat16>& host, unsigned seed)
 {
     std::mt19937 engine(seed);
-    // Unit scale. Scores are then O(sqrt(d)) before the 1/sqrt(d) factor, so the
-    // softmax sees inputs of order 1, which is the regime a trained model runs in.
-    // A large-scale variant would only test the max subtraction, and that is
-    // already covered in stable_softmax.
+    // true distribution of the training value
     std::normal_distribution<float> dist(0.0f, 1.0f);
     for (auto& value : host) value = __float2bfloat16(dist(engine));
 }
 
+// ulp error caculate, return ulp data
 float bf16_ulp(float value)
 {
-    if (value == 0.0f || !std::isfinite(value)) return std::ldexp(1.0f, -126 - 7);
+    if (value == 0.0f || !std::isfinite(value)) return std::ldexp(1.0f, -126 - 7); // return 2 * exp（-133）， which is the min ulp
 
     int exponent = 0;
-    std::frexp(std::abs(value), &exponent);
+    std::frexp(std::abs(value), &exponent); // get exponent
     return std::ldexp(1.0f, exponent - 8);
 }
 
-// Double-precision attention on the host. Straightforward and slow: the point is
-// to share no code and no arithmetic order with any device kernel, so agreement
-// means something.
-void reference_attention(const std::vector<__nv_bfloat16>& q, const std::vector<__nv_bfloat16>& k, const std::vector<__nv_bfloat16>& v,
-                         std::vector<double>& out, const AttentionShape& shape, bool causal)
+// baseline reference kernel
+void reference_attention(const std::vector<__nv_bfloat16>& q, const std::vector<__nv_bfloat16>& k, const std::vector<__nv_bfloat16>& v, std::vector<double>& out, const AttentionShape& shape, bool causal)
 {
     const int n = shape.seq_len;
     const int d = shape.head_dim;
@@ -174,9 +104,7 @@ void reference_attention(const std::vector<__nv_bfloat16>& q, const std::vector<
             for (int key = 0; key < limit; ++key)
             {
                 double dot = 0.0;
-                for (int dim = 0; dim < d; ++dim)
-                    dot += static_cast<double>(__bfloat162float(q[slab + static_cast<size_t>(query) * d + dim])) *
-                           static_cast<double>(__bfloat162float(k[slab + static_cast<size_t>(key) * d + dim]));
+                for (int dim = 0; dim < d; ++dim) dot += static_cast<double>(__bfloat162float(q[slab + static_cast<size_t>(query) * d + dim])) * static_cast<double>(__bfloat162float(k[slab + static_cast<size_t>(key) * d + dim]));
                 scores[key] = dot * scale;
                 row_max = std::max(row_max, scores[key]);
             }
@@ -191,29 +119,21 @@ void reference_attention(const std::vector<__nv_bfloat16>& q, const std::vector<
             for (int dim = 0; dim < d; ++dim)
             {
                 double accumulator = 0.0;
-                for (int key = 0; key < limit; ++key)
-                    accumulator += scores[key] * static_cast<double>(__bfloat162float(v[slab + static_cast<size_t>(key) * d + dim]));
+                for (int key = 0; key < limit; ++key) accumulator += scores[key] * static_cast<double>(__bfloat162float(v[slab + static_cast<size_t>(key) * d + dim]));
                 out[slab + static_cast<size_t>(query) * d + dim] = accumulator / sum;
             }
         }
     }
 }
 
+// accurancy data struct
 struct Accuracy
 {
     float vs_double;
     float ulp;
 };
 
-// vs_double is the largest per-element relative deviation from the double
-// reference. It is reported for context only: bf16 storage caps it at roughly
-// 2^-8 = 3.9e-3 regardless of kernel quality, so it cannot separate a correct
-// kernel from a slightly wrong one.
-//
-// ulp is the gate. Error is normalized by one bf16 ULP at the row's largest
-// element rather than at each element's own value, for the cancellation reason in
-// the file header: the row is what the arithmetic operated on, so the row's scale
-// is what bounds the achievable absolute error for every element in it.
+// vs_double as reference, ulp as the comparativate reference
 Accuracy compare(const std::vector<__nv_bfloat16>& device_out, const std::vector<double>& reference, const AttentionShape& shape)
 {
     Accuracy result{0.0f, 0.0f};
@@ -228,7 +148,7 @@ Accuracy compare(const std::vector<__nv_bfloat16>& device_out, const std::vector
         double row_scale = 0.0;
         for (int dim = 0; dim < d; ++dim) row_scale = std::max(row_scale, std::abs(reference[base + dim]));
 
-        const float scale_ulp = bf16_ulp(static_cast<float>(row_scale));
+        const float scale_ulp = bf16_ulp(static_cast<float>(row_scale)); // reference of ulp
 
         for (int dim = 0; dim < d; ++dim)
         {
@@ -246,24 +166,20 @@ Accuracy compare(const std::vector<__nv_bfloat16>& device_out, const std::vector
     return result;
 }
 
-// Bytes that have to cross the memory bus, derived from the algorithm rather than
-// measured. Reported as an algorithmic property, not a profiler reading: the L2
-// absorbs some of the fused kernels' K/V re-reads, so the real DRAM figure is
-// lower than the fused number below and higher than its ideal. What the column
-// establishes is the asymptotic difference, which is not sensitive to that.
+// get DRAM memory traffic
 double qkvo_bytes(const AttentionShape& shape)
 {
     // Q, K, V read once and O written once, all bf16.
     return 4.0 * shape.batch * shape.heads * shape.seq_len * shape.head_dim * sizeof(__nv_bfloat16);
 }
 
+// basline
 double unfused_score_bytes(const AttentionShape& shape)
 {
-    // Written by the scores kernel, read and rewritten by the softmax, read by the
-    // PV kernel: five passes over an fp32 [N, N] matrix per (batch, head).
     return 5.0 * shape.batch * shape.heads * static_cast<double>(shape.seq_len) * shape.seq_len * sizeof(float);
 }
 
+// same handle of each kernel
 float time_iterations(void (*body)(void*), void* context)
 {
     for (int iter = 0; iter < kWarmupIters; ++iter) body(context);
@@ -288,6 +204,7 @@ float time_iterations(void (*body)(void*), void* context)
     return elapsed_ms / static_cast<float>(kTimedIters);
 }
 
+// kernel launch param struct
 struct Buffers
 {
     const __nv_bfloat16* q;
@@ -324,8 +241,7 @@ int main()
     std::printf("device: %s  (sm_%d%d)\n", props.name, props.major, props.minor);
     std::printf("dtype: bf16 storage, fp32 accumulate\n");
     std::printf("HBM GB is the algorithmic traffic, not a profiler reading: v0 includes the fp32 score matrix, fused kernels do not.\n");
-    std::printf("accuracy: ulp is the pass/fail number, measured at the row scale (not per element -- attention output cancels), tolerance %.1f\n\n",
-                kUlpTolerance);
+    std::printf("accuracy: ulp is the pass/fail number, measured at the row scale (not per element -- attention output cancels), tolerance %.1f\n\n", kUlpTolerance);
 
     std::printf("v1 configuration (local_bytes must be 0, or the output accumulator spilled):\n");
     std::printf("  %10s %10s %8s %14s %8s %8s %12s\n", "head_dim", "block", "tile_n", "shared/block", "regs", "local", "blocks/SM");
@@ -337,16 +253,13 @@ int main()
             std::printf("  %10d   unsupported\n", head_dim);
             continue;
         }
-        std::printf("  %10d %10d %8d %12dB %8d %7dB %12d\n", head_dim, info.block_size, info.tile_n, info.shared_bytes_per_block,
-                    info.registers_per_thread, info.local_bytes_per_thread, info.max_blocks_per_sm);
+        std::printf("  %10d %10d %8d %12dB %8d %7dB %12d\n", head_dim, info.block_size, info.tile_n, info.shared_bytes_per_block, info.registers_per_thread, info.local_bytes_per_thread, info.max_blocks_per_sm);
     }
     std::printf("\n");
 
     bool all_passed = true;
 
-    // ---------------------------------------------------------------------
-    // Accuracy, on one small shape, both mask settings.
-    // ---------------------------------------------------------------------
+    // Accuracy, on one small shape, both casual mask settings.
     {
         std::printf("accuracy check (batch=%d heads=%d seq=%d):\n", kAccuracyBatch, kAccuracyHeads, kAccuracySeq);
         std::printf("  %-16s %8s %8s %14s %10s\n", "kernel", "head_dim", "causal", "vs_double", "ulp");
@@ -398,10 +311,8 @@ int main()
                     if (entry.fused && !fused_row_supported(head_dim)) continue;
 
                     CUDA_CHECK(cudaMemset(device_o, 0, bytes));
-                    if (entry.fused)
-                        launch_attention_fused_row(device_q, device_k, device_v, device_o, shape, causal, nullptr);
-                    else
-                        launch_attention_unfused(device_q, device_k, device_v, device_o, workspace, shape, causal, nullptr);
+                    if (entry.fused) launch_attention_fused_row(device_q, device_k, device_v, device_o, shape, causal, nullptr);
+                    else launch_attention_unfused(device_q, device_k, device_v, device_o, workspace, shape, causal, nullptr);
                     CUDA_CHECK(cudaDeviceSynchronize());
                     CUDA_CHECK(cudaMemcpy(host_o.data(), device_o, bytes, cudaMemcpyDeviceToHost));
 
@@ -425,9 +336,7 @@ int main()
         std::printf("\n");
     }
 
-    // ---------------------------------------------------------------------
-    // Performance.
-    // ---------------------------------------------------------------------
+    // Performance
     for (const Case& item : kCases)
     {
         const AttentionShape& shape = item.shape;
@@ -483,10 +392,6 @@ int main()
         if (fused_row_supported(shape.head_dim))
         {
             const float ms = time_iterations(run_fused_row, &buffers);
-            // K and V are re-read once per query row, which is the term v2 exists
-            // to remove. Counting it here rather than the ideal N*d makes the
-            // number comparable to v0's and makes v2's improvement visible in the
-            // same column.
             const double kv_reread = 2.0 * shape.batch * shape.heads * static_cast<double>(shape.seq_len) * shape.seq_len * shape.head_dim *
                                      sizeof(__nv_bfloat16) * (item.causal ? 0.5 : 1.0);
             const double gb = (qkvo_bytes(shape) + kv_reread) / 1.0e9;
